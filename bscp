@@ -1,10 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
-# Copyright (C) 2012-2016
+# Copyright (C) 2012-2020
 #
 # * Volker Diels-Grabsch <v@njh.eu>
 # * art0int <zvn_mail@mail.ru>
 # * Matthew Fearnley (matthew.w.fearnley@gmail.com)
+# * Alexandr Moskalev <moskalev@umich.edu>
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -22,21 +23,40 @@ import hashlib
 import struct
 import subprocess
 import sys
+import time
+from multiprocessing import Pool, Manager
+from Queue import Queue, Empty
+from threading import Thread
 
-remote_script = r'''
+
+
+remote_script_head = r'''
 import hashlib
 import os
 import os.path
 import struct
 import sys
+import socket
+import random
 
-(size, blocksize, filename_len, hashname_len) = struct.unpack('<QQQQ', sys.stdin.read(8+8+8+8))
+host = '127.0.0.1'
+port = random.randint(32768, 65535)
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind((host, port))
+s.listen(1)
+
+(size, blocksize, filename_len, hashname_len, tcp_blocksize) = struct.unpack('<QQQQQ', sys.stdin.read(8+8+8+8+8))
 filename = sys.stdin.read(filename_len)
 hashname = sys.stdin.read(hashname_len)
 
 sanity_hash = hashlib.new(hashname, filename).digest()
 sys.stdout.write(sanity_hash)
 sys.stdout.flush()
+
+sys.stdout.write(struct.pack('<Q', port))
+sys.stdout.flush()
+
 if sys.stdin.read(2) != 'go':
     sys.exit()
 
@@ -64,14 +84,55 @@ with open(filename, 'rb+') as f:
         if readremain == 0:
 	    break
     sys.stdout.flush()
+    
+    # Writing the blocks of file:
+    position = -1
     while True:
-        position_s = sys.stdin.read(8)
+        sys.stdout.flush()
+        
+        conn, addr = s.accept()
+        
+        sys.stdout.flush()
+
+        data = b''
+        rb = conn.recv(blocksize + 8)
+        while len(rb) > 0:
+            data += rb
+            rb = conn.recv(blocksize + 8)
+        
+        sys.stdout.flush()
+        
+        if len(data) == 0:
+            break
+        
+        position_s = data[:8]
+        sys.stdout.flush()
+        
         if len(position_s) == 0:
             break
+
+        sys.stdout.flush()
+        
         (position,) = struct.unpack('<Q', position_s)
-        block = sys.stdin.read(blocksize)
+        
+        if position == 9223372036854775807:
+            break
+        
+        sys.stdout.flush()
+        
+        block = data[8:]
+        sys.stdout.flush()
+        
         f.seek(position)
-        f.write(block)
+        if position + blocksize < size:
+            f.write(block)
+        else:
+            f.write(block[:size - position])
+        
+        conn.close()
+            
+        
+        
     readremain = size
     rblocksize = blocksize
     hash_total = hashlib.new(hashname)
@@ -85,9 +146,41 @@ with open(filename, 'rb+') as f:
         hash_total.update(block)
         readremain -= rblocksize
         if readremain == 0:
-	    break
-sys.stdout.write(hash_total.digest())
+            break
+
+    sys.stdout.write(hash_total.digest())
 '''
+
+remote_script_pipe = r'''
+import socket
+import struct
+import sys
+
+host = '127.0.0.1'
+(port, blocksize, tcp_blocksize) = struct.unpack('<QQQ', sys.stdin.read(8+8+8))
+sys.stdout.write(struct.pack('<QQ', port, blocksize))
+sys.stdout.flush()
+
+while True:
+    dblock = sys.stdin.read(8 + blocksize)
+    
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host, port))
+        s.sendall(dblock)
+    finally:
+        s.close()
+    
+    (position,) = struct.unpack('<Q', dblock[:8])
+    if position == 9223372036854775807:
+        break
+'''
+
+def sizeof_fmt(num): # https://web.archive.org/web/20111010015624/http://blogmag.net/blog/read/38/Print_human_readable_file_size
+    for x in ['bytes','KiB','MiB','GiB','TiB']:
+        if num < 1024.0:
+            return "%3.1f%s" % (num, x)
+        num /= 1024.0
 
 class IOCounter:
     def __init__(self, in_stream, out_stream):
@@ -95,19 +188,52 @@ class IOCounter:
         self.out_stream = out_stream
         self.in_total = 0
         self.out_total = 0
+        
     def read(self, size=None):
         if size is None:
             s = self.in_stream.read()
         else:
             s = self.in_stream.read(size)
+        
         self.in_total += len(s)
         return s
+    
     def write(self, s):
         self.out_stream.write(s)
         self.out_total += len(s)
         self.out_stream.flush()
+        
+def piper(remote_host, port, blocksize, in_queue, tcp_blocksize):
+    remote_command = 'python2 -c "%s"' % (remote_script_pipe,)
+    command = ('ssh', '--', remote_host, remote_command)
+    p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    io = IOCounter(p.stdout, p.stdin)
+    
+    io.write(struct.pack('<QQQ', port, blocksize, tcp_blocksize))
+    
+    while True:
+        dblock = in_queue.get()
+        if dblock is None:
+            break
+        
+        io.write(struct.pack('<Q', dblock[0]))
+        
+        io.write(dblock[1] + bytearray(blocksize - len(dblock[1])))
 
-def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
+    io.write(struct.pack('<Q', 9223372036854775807))
+    io.write(bytearray(blocksize))
+    
+    p.stdin.close()
+    p.wait()
+    
+    return (io.in_total, io.out_total)
+    
+        
+
+def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thread_count=1, buffer_cnt = 256):
+
+    tcp_blocksize = 1024
+    
     hash_total = hashlib.new(hashname)
     with open(local_filename, 'rb') as f:
         f.seek(0, 2)
@@ -117,19 +243,23 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
         # Calculate number of blocks, including the last block which may be smaller
         blockcount = int((size + blocksize - 1) / blocksize)
 
-        remote_command = 'python -c "%s"' % (remote_script,)
+        remote_command = 'python2 -c "%s"' % (remote_script_head,)
         command = ('ssh', '--', remote_host, remote_command)
         p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         io = IOCounter(p.stdout, p.stdin)
 
-        io.write(struct.pack('<QQQQ', size, blocksize, len(remote_filename), len(hashname)))
+        io.write(struct.pack('<QQQQQ', size, blocksize, len(remote_filename), len(hashname), tcp_blocksize))
         io.write(remote_filename)
         io.write(hashname)
 
         sanity_digest = hashlib.new(hashname, remote_filename).digest()
         remote_digest = io.read(len(sanity_digest))
+        
+        (port,) = struct.unpack('<Q', io.read(8))
+        
         if remote_digest != sanity_digest:
             raise RuntimeError('Remote script failed to execute properly')
+
         io.write('go')
 
         (remote_size,) = struct.unpack('<Q', io.read(8))
@@ -137,6 +267,17 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
             raise RuntimeError('Remote size less than local (local: %i, remote: %i)' % (size, remote_size))
         remote_digest_list = [io.read(hash_total.digestsize) for i in xrange(blockcount)]
 
+        # start pipe pool
+        manager = Manager()
+        data_queue = manager.Queue()
+        pool = Pool(processes=thread_count)              # start N worker processes
+        workers = []
+        for i in range(thread_count):
+            workers.append(pool.apply_async(piper, args=(remote_host, port, blocksize, data_queue, tcp_blocksize)))
+        
+        queed = 0
+        ts = time.time()
+        
         for remote_digest in remote_digest_list:
             position = f.tell()
             block = f.read(blocksize)
@@ -144,17 +285,41 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
             digest = hashlib.new(hashname, block).digest()
             if digest != remote_digest:
                 try:
-                    io.write(struct.pack('<Q', position))
-                    io.write(block)
+                    while data_queue.qsize() >  buffer_cnt: # too many blocks in a Queue
+                        time.sleep(0.1)
+                    
+                    data_queue.put([position, block])
                 except IOError:
                     break
+            
+            queed += blocksize
+            
+            if time.time() - ts > 2:
+                sys.stdout.write("\r Speed " + str(sizeof_fmt(queed / (time.time() - ts))) + '/s, queue length ' + str(data_queue.qsize()) + '/' + str(buffer_cnt) + ", frontier position {0:.2f}%".format(position*100.0/size) + " "*10)
+                sys.stdout.flush()
+                
+                ts = time.time()
+                queed = 0
+        
+        for i in range(thread_count):
+            data_queue.put(None)
+        
         p.stdin.close()
 
         remote_digest_total = io.read()
         p.wait()
+        checksum = True
         if remote_digest_total != hash_total.digest():
-            raise RuntimeError('Checksum mismatch after transfer')
-    return (io.in_total, io.out_total, size)
+            checksum = False
+    
+    workers_get = []
+    for x in workers:
+        try:
+            workers_get.append(x.get())
+        except:
+            pass # this happens when ssh connection was not established properly
+    
+    return (io.in_total + sum([x[0] for x in workers_get]), io.out_total + sum([x[1] for x in workers_get]), size, checksum)
 
 if __name__ == '__main__':
     try:
@@ -168,11 +333,25 @@ if __name__ == '__main__':
             hashname = sys.argv[4]
         else:
             hashname = 'sha1'
-        assert len(sys.argv) <= 5
+        if len(sys.argv) >= 6:
+            thread_count = int(sys.argv[5])
+        else:
+            thread_count = 32
+        assert len(sys.argv) <= 6
     except:
-        usage = 'bscp SRC HOST:DEST [BLOCKSIZE] [HASH]'
+        usage = 'bscp SRC HOST:DEST [BLOCKSIZE] [HASH] [THREADS]'
         sys.stderr.write('Usage:\n\n    %s\n\n' % (usage,))
         sys.exit(1)
-    (in_total, out_total, size) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname)
+    
+    (in_total, out_total, size, checksum) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thread_count=thread_count)
+    print('Finishing file transfer')
+    while checksum is False:
+        thread_count = thread_count // 2
+        if thread_count < 1:
+            thread_count = 1
+        (in_bytes, out_bytes, size, checksum) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thread_count=thread_count)
+        in_total += in_bytes
+        out_total += out_bytes
+        
     speedup = size * 1.0 / (in_total + out_total)
     sys.stderr.write('in=%i out=%i size=%i speedup=%.2f\n' % (in_total, out_total, size, speedup))
