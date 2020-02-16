@@ -46,7 +46,7 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.bind((host, port))
 s.listen(1)
 
-(size, blocksize, filename_len, hashname_len, tcp_blocksize) = struct.unpack('<QQQQQ', sys.stdin.read(8+8+8+8+8))
+(size, blocksize, filename_len, hashname_len, tcp_blocksize, byte_skip) = struct.unpack('<QQQQQQ', sys.stdin.read(8+8+8+8+8+8))
 filename = sys.stdin.read(filename_len)
 hashname = sys.stdin.read(hashname_len)
 
@@ -69,9 +69,9 @@ if not os.path.exists(filename):
 with open(filename, 'rb+') as f:
     f.seek(0, 2)
     sys.stdout.write(struct.pack('<Q', f.tell()))
-    readremain = size
+    readremain = size - byte_skip
     rblocksize = blocksize
-    f.seek(0)
+    f.seek(0 + byte_skip)
     while True:
         if readremain <= blocksize:
             rblocksize = readremain
@@ -88,40 +88,28 @@ with open(filename, 'rb+') as f:
     # Writing the blocks of file:
     position = -1
     while True:
-        sys.stdout.flush()
-        
         conn, addr = s.accept()
         
-        sys.stdout.flush()
-
         data = b''
         rb = conn.recv(blocksize + 8)
         while len(rb) > 0:
             data += rb
             rb = conn.recv(blocksize + 8)
-        
-        sys.stdout.flush()
-        
+                
         if len(data) == 0:
             break
         
         position_s = data[:8]
-        sys.stdout.flush()
         
         if len(position_s) == 0:
             break
 
-        sys.stdout.flush()
-        
         (position,) = struct.unpack('<Q', position_s)
         
         if position == 9223372036854775807:
             break
         
-        sys.stdout.flush()
-        
         block = data[8:]
-        sys.stdout.flush()
         
         f.seek(position)
         if position + blocksize < size:
@@ -133,10 +121,10 @@ with open(filename, 'rb+') as f:
             
         
         
-    readremain = size
+    readremain = size - byte_skip
     rblocksize = blocksize
     hash_total = hashlib.new(hashname)
-    f.seek(0)
+    f.seek(0 + byte_skip)
     while True:
         if readremain <= blocksize:
             rblocksize = readremain
@@ -149,6 +137,7 @@ with open(filename, 'rb+') as f:
             break
 
     sys.stdout.write(hash_total.digest())
+    sys.stdout.flush()
 '''
 
 remote_script_pipe = r'''
@@ -203,6 +192,16 @@ class IOCounter:
         self.out_total += len(s)
         self.out_stream.flush()
         
+class IOBadBlocks:
+    def __init__(self):
+        self.bad_blocks = set()
+        
+    def add(self, position):
+        self.bad_blocks.add(position)
+        
+    def check(self, position):
+        return (position in self.bad_blocks)
+        
 def piper(remote_host, port, blocksize, in_queue, tcp_blocksize):
     remote_command = 'python2 -c "%s"' % (remote_script_pipe,)
     command = ('ssh', '--', remote_host, remote_command)
@@ -230,7 +229,7 @@ def piper(remote_host, port, blocksize, in_queue, tcp_blocksize):
     
         
 
-def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thread_count=1, buffer_cnt = 256):
+def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, bad_blocks, thread_count=1, buffer_cnt = 255, ignore_io_errors = False, byte_skip = 0):
 
     tcp_blocksize = 1024
     
@@ -238,17 +237,17 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thre
     with open(local_filename, 'rb') as f:
         f.seek(0, 2)
         size = f.tell()
-        f.seek(0)
+        f.seek(0 + byte_skip)
 
         # Calculate number of blocks, including the last block which may be smaller
-        blockcount = int((size + blocksize - 1) / blocksize)
+        blockcount = int((size + blocksize - 1 - byte_skip) / blocksize)
 
         remote_command = 'python2 -c "%s"' % (remote_script_head,)
         command = ('ssh', '--', remote_host, remote_command)
         p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         io = IOCounter(p.stdout, p.stdin)
 
-        io.write(struct.pack('<QQQQQ', size, blocksize, len(remote_filename), len(hashname), tcp_blocksize))
+        io.write(struct.pack('<QQQQQQ', size, blocksize, len(remote_filename), len(hashname), tcp_blocksize, byte_skip))
         io.write(remote_filename)
         io.write(hashname)
 
@@ -280,12 +279,23 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thre
         
         for remote_digest in remote_digest_list:
             position = f.tell()
-            block = f.read(blocksize)
+            try:
+                if ignore_io_errors & (bad_blocks.check(position)):
+                    raise RuntimeError('IO Error expected')
+                else:
+                    block = f.read(blocksize)
+            except: # happens when we have an IO error on a disk
+                block = bytearray(blocksize)
+                f.seek(position + blocksize) # move to the next block on the disk
+                bad_blocks.add(position)
+                if not ignore_io_errors:
+                    raise RuntimeError('IO Error occured. Please use IGNORE_IO_ERRORS_FLAG to skip bad blocks')
+                
             hash_total.update(block)
             digest = hashlib.new(hashname, block).digest()
             if digest != remote_digest:
                 try:
-                    while data_queue.qsize() >  buffer_cnt: # too many blocks in a Queue
+                    while data_queue.qsize() >=  buffer_cnt: # too many blocks in a Queue
                         time.sleep(0.1)
                     
                     data_queue.put([position, block])
@@ -295,7 +305,7 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thre
             queed += blocksize
             
             if time.time() - ts > 2:
-                sys.stdout.write("\r Speed " + str(sizeof_fmt(queed / (time.time() - ts))) + '/s, queue length ' + str(data_queue.qsize()) + '/' + str(buffer_cnt) + ", frontier position {0:.2f}%".format(position*100.0/size) + " "*10)
+                sys.stdout.write("\r Speed " + str(sizeof_fmt(queed / (time.time() - ts))) + "/s, queue length " + str(data_queue.qsize()) + "/" + str(buffer_cnt) + ", frontier position {0:.2f}%".format(position*100.0/size) + " "*10)
                 sys.stdout.flush()
                 
                 ts = time.time()
@@ -337,19 +347,38 @@ if __name__ == '__main__':
             thread_count = int(sys.argv[5])
         else:
             thread_count = 32
-        assert len(sys.argv) <= 6
+        if len(sys.argv) >= 7:
+            queue_len = int(sys.argv[6])
+        else:
+            queue_len = 255
+        if len(sys.argv) >= 8:
+            byte_skip = int(sys.argv[7])
+        else:
+            byte_skip = 0
+        if len(sys.argv) >= 9:
+            if int(sys.argv[8]) > 0:
+                ignore_IO_errors = True
+        else:
+            ignore_IO_errors = False
+        assert len(sys.argv) <= 9
+        assert blocksize > 0
+        assert thread_count > 0
+        assert queue_len > 0
+        
     except:
-        usage = 'bscp SRC HOST:DEST [BLOCKSIZE] [HASH] [THREADS]'
+        usage = 'bscp SRC HOST:DEST [BLOCKSIZE] [HASH, use ''sha1''] [THREADS] [QUEUE_LENGTH] [BYTE_SKIP] [IGNORE_IO_ERRORS_FLAG]'
         sys.stderr.write('Usage:\n\n    %s\n\n' % (usage,))
         sys.exit(1)
     
-    (in_total, out_total, size, checksum) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thread_count=thread_count)
+    bad_blocks = IOBadBlocks()
+    
+    (in_total, out_total, size, checksum) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname, bad_blocks, thread_count=thread_count, buffer_cnt=queue_len, byte_skip=byte_skip, ignore_io_errors=ignore_IO_errors)
     print('Finishing file transfer')
     while checksum is False:
         thread_count = thread_count // 2
         if thread_count < 1:
             thread_count = 1
-        (in_bytes, out_bytes, size, checksum) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname, thread_count=thread_count)
+        (in_bytes, out_bytes, size, checksum) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname, bad_blocks, thread_count=thread_count, buffer_cnt=queue_len, byte_skip=byte_skip, ignore_io_errors=ignore_IO_errors)
         in_total += in_bytes
         out_total += out_bytes
         
