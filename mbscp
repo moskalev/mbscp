@@ -82,7 +82,7 @@ with open(filename, 'rb+') as f:
         sys.stdout.write(digest)
         readremain -= rblocksize
         if readremain == 0:
-	    break
+            break
     sys.stdout.flush()
     
     # Writing the blocks of file:
@@ -273,12 +273,15 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, bad_
         workers = []
         for i in range(thread_count):
             workers.append(pool.apply_async(piper, args=(remote_host, port, blocksize, data_queue, tcp_blocksize)))
+            time.sleep(1) # to allow the process to connect to the remote host without concurrent attempts
         
         queed = 0
         ts = time.time()
         
+        position = f.tell()
         for remote_digest in remote_digest_list:
-            position = f.tell()
+            if position != f.tell(): # in case the drive has severe read problems
+                f.seek(position)
             try:
                 if ignore_io_errors & (bad_blocks.check(position)):
                     raise RuntimeError('IO Error expected')
@@ -310,6 +313,8 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, bad_
                 
                 ts = time.time()
                 queed = 0
+            
+            position += blocksize
         
         for i in range(thread_count):
             data_queue.put(None)
