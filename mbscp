@@ -280,12 +280,12 @@ def bscp(local_filename, remote_host, remote_filename, blocksize, hashname, bad_
         
         position = f.tell()
         for remote_digest in remote_digest_list:
-            if position != f.tell(): # in case the drive has severe read problems
-                f.seek(position)
             try:
                 if ignore_io_errors & (bad_blocks.check(position)):
                     raise RuntimeError('IO Error expected')
                 else:
+                    if position != f.tell(): # in case the drive has severe read problems
+                        f.seek(position)
                     block = f.read(blocksize)
             except: # happens when we have an IO error on a disk
                 block = bytearray(blocksize)
